@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.supportagent"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     // Keep Java and Kotlin targeting the same JVM version.
@@ -36,5 +36,6 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.3.1")
     implementation("androidx.compose.foundation:foundation:1.7.8")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("io.coil-kt:coil-compose:2.7.0")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.8")
 }
