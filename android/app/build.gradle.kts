@@ -15,6 +15,16 @@ android {
         versionCode = 1
         versionName = "1.0"
     }
+
+    // Keep Java and Kotlin targeting the same JVM version.
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
