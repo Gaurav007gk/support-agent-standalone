@@ -190,7 +190,8 @@ Return ONLY valid JSON, with exactly these fields:
 """.trimIndent()
 
         val request = JSONObject().apply {
-            put("model", "gpt-5.6-luna")
+            // gpt-5 supports image input through the Responses API.
+            put("model", "gpt-5")
             put("input", org.json.JSONArray().put(
                 JSONObject().apply {
                     put("role", "user")
@@ -347,7 +348,7 @@ fun App() {
                 title = { Text("AI image verification") },
                 text = {
                     Column {
-                        Text("Enter your OpenAI API key. It is stored only on this phone for this demo.")
+                        Text("Enter your OpenAI API key. For this demo it is stored locally on this phone. Do not use a production secret in a client app.")
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
                             value = apiKey,
@@ -460,7 +461,7 @@ fun CustomerScreen(engine: SupportEngine, apiKey: String) {
                                                     engine.verifyPhotoEvidence(context, photos, issue, apiKey)
                                                 }
                                                 val ticketId = engine.createPhotoTicket(issue, null, result)
-                                                verificationMessage = ""
+                                                verificationMessage = null
                                                 messages.add(
                                                     Message(
                                                         "Agent",
