@@ -16,6 +16,13 @@ data class Message(val sender: String, val text: String)
 data class Ticket(val id: Int, val summary: String, var status: String = "OPEN")
 data class Order(val id: String, var status: String, val item: String, val price: Int)
 
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { App() }
+    }
+}
+
 class SupportEngine {
     val orders = mutableListOf(
         Order("ORD-1001", "OUT_FOR_DELIVERY", "Paneer Biryani", 320),
