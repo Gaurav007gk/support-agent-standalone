@@ -33,23 +33,48 @@ class SupportEngine {
     private var nextTicket = 1001
 
     fun reply(input: String): String {
-        val text = input.lowercase()
+        val text = input.lowercase().trim()
+
         if (listOf("human", "executive", "agent please", "talk to someone").any { text.contains(it) }) {
             escalate("Customer requested a human executive")
-            return "I’ll connect you with a human executive. Ticket #${tickets.last().id} has been created."
+            return "I'll connect you with a human executive. Ticket #${tickets.last().id} has been created."
         }
+
         if (listOf("medical emergency", "severe chest pain", "unconscious").any { text.contains(it) }) {
             escalate("Safety-sensitive issue")
             return "This may require immediate human assistance. I have escalated this conversation to an executive."
         }
 
-        val order = orders.firstOrNull { text.contains(it.id.lowercase()) }
-        if (listOf("late", "delayed", "where is my order", "delivery").any { text.contains(it) }) {
-            if (order == null) return "Sure. Please share your order ID, for example ORD-1001."
+        // Accept both "ORD-1001" and just "1001" as an order ID.
+        val order = orders.firstOrNull { orderItem ->
+            text.contains(orderItem.id.lowercase()) ||
+                    text.contains(orderItem.id.removePrefix("ORD-").lowercase())
+        }
+
+        val isOrderTrackingRequest = listOf(
+            "where is my order",
+            "where are my orders",
+            "where is my orders",
+            "track my order",
+            "track my orders",
+            "order status",
+            "order tracking",
+            "delivery status",
+            "delivery",
+            "delayed",
+            "late",
+            "orders"
+        ).any { text.contains(it) }
+
+        if (isOrderTrackingRequest) {
+            if (order == null) {
+                return "Sure. Please share your order ID, for example ORD-1001 or 1001."
+            }
             return when (order.status) {
                 "OUT_FOR_DELIVERY" -> "Your order ${order.id} is out for delivery and should arrive soon."
                 "PREPARING" -> "Your order ${order.id} is still being prepared by the restaurant."
                 "DELIVERED" -> "Your order ${order.id} shows as delivered."
+                "CANCELLED" -> "Your order ${order.id} has been cancelled."
                 else -> "I checked ${order.id}, but I need an executive to investigate further."
             }
         }
@@ -78,7 +103,7 @@ class SupportEngine {
             return "I've escalated the refund issue to a human executive for review."
         }
 
-        if (text.contains("hi") || text.contains("hello")) {
+        if (text == "hi" || text == "hello" || text.startsWith("hi ") || text.startsWith("hello ")) {
             return "Hi! I'm your support assistant. Tell me what went wrong and I'll try to resolve it."
         }
 
