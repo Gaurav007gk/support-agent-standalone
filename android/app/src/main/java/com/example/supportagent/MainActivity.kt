@@ -1,9 +1,11 @@
 package com.example.supportagent
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -18,8 +20,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.time.LocalDate
 
 data class Message(val sender: String, val text: String)
 data class Ticket(val id: Int, val summary: String, var status: String = "OPEN")
@@ -31,6 +42,13 @@ enum class PhotoIssue(val displayName: String) {
     SPILLAGE("Spillage"),
     BROKEN("Broken/damaged product")
 }
+
+data class VisionResult(
+    val verdict: String,
+    val confidence: Double,
+    val evidence: String,
+    val nextAction: String
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -132,28 +150,155 @@ class SupportEngine {
         return "I don't want to give you an incorrect answer. I've escalated this conversation to a human executive."
     }
 
-    fun verifyPhotoEvidence(context: Context, photos: List<Uri>, issue: PhotoIssue): String {
-        if (photos.size < 2) return "Please upload at least 2 photos before verification."
+    fun verifyPhotoEvidence(context: Context, photos: List<Uri>, issue: PhotoIssue, apiKey: String): VisionResult {
+        require(photos.size >= 2) { "Please upload at least 2 photos before verification." }
+        require(apiKey.isNotBlank()) { "Please configure an OpenAI API key first." }
 
-        for ((index, uri) in photos.withIndex()) {
-            val valid = try {
-                context.contentResolver.openInputStream(uri)?.use { stream ->
-                    BitmapFactory.decodeStream(stream) != null
-                } ?: false
-            } catch (_: Exception) {
-                false
-            }
-            if (!valid) return "Photo ${index + 1} could not be read. Please upload a clear image."
+        val imageDataUrls = photos.mapIndexed { index, uri ->
+            val bytes = imageToJpeg(context, uri)
+                ?: throw IllegalArgumentException("Photo ${index + 1} could not be read.")
+            "data:image/jpeg;base64,${Base64.encodeToString(bytes, Base64.NO_WRAP)}"
         }
 
-        return "${photos.size} photos received for '${issue.displayName}'. Photo quality/count checks passed."
+        val today = LocalDate.now()
+        val prompt = """
+You are the visual evidence verifier for a customer-support app.
+
+Customer complaint category: ${issue.displayName}
+Today's date: $today
+Number of uploaded photos: ${photos.size}
+
+Analyze ALL uploaded photos together. Determine whether the photos actually provide visual evidence for the customer's stated complaint.
+Do not approve a complaint just because a product is present. The claimed issue must be visibly supported.
+
+Rules:
+- EXPIRED: only mark VERIFIED when an expiry/best-before date is clearly readable and is past today's date. If the date is unreadable, mark UNCLEAR.
+- SPILLAGE: look for visible spilled liquid/food, leakage, wet packaging, or an open container with contents visibly spilled.
+- BROKEN/DAMAGED: look for visible cracks, breakage, crushing, torn packaging, or other physical damage.
+- BAD FOOD: look for visible signs such as obvious spoilage, mold, severe contamination, or clearly abnormal appearance. A photo cannot prove that food is medically unsafe; if it is not visually clear, use UNCLEAR.
+- Require the product/problem to be visible in the evidence. Reject unrelated screenshots, selfies, blank images, or unrelated objects.
+- Use UNCLEAR when image quality, angle, lighting, or missing label information prevents a reliable conclusion.
+- Do not invent details that are not visible.
+
+Return ONLY valid JSON, with exactly these fields:
+{
+  "verdict": "VERIFIED" | "NOT_VERIFIED" | "UNCLEAR",
+  "confidence": number between 0 and 1,
+  "evidence": "short explanation of what is visibly supported or missing",
+  "next_action": "REFUND_OR_REPLACE" | "ASK_FOR_CLEARER_PHOTOS" | "ESCALATE_TO_HUMAN"
+}
+""".trimIndent()
+
+        val request = JSONObject().apply {
+            put("model", "gpt-5.6-luna")
+            put("input", org.json.JSONArray().put(
+                JSONObject().apply {
+                    put("role", "user")
+                    val content = org.json.JSONArray()
+                    content.put(JSONObject().apply {
+                        put("type", "input_text")
+                        put("text", prompt)
+                    })
+                    imageDataUrls.forEach { dataUrl ->
+                        content.put(JSONObject().apply {
+                            put("type", "input_image")
+                            put("image_url", dataUrl)
+                            put("detail", "high")
+                        })
+                    }
+                    put("content", content)
+                }
+            ))
+        }
+
+        val responseText = postOpenAi(apiKey, request.toString())
+        return parseVisionResult(responseText)
     }
 
-    fun createPhotoTicket(issue: PhotoIssue, orderId: String?): Int {
-        val summary = if (orderId != null) {
-            "${issue.displayName} complaint with photo evidence for $orderId"
-        } else {
-            "${issue.displayName} complaint with photo evidence"
+    private fun imageToJpeg(context: Context, uri: Uri): ByteArray? {
+        val input = context.contentResolver.openInputStream(uri) ?: return null
+        val original = input.use { BitmapFactory.decodeStream(it) } ?: return null
+
+        val maxDimension = 1600
+        val scale = minOf(1f, maxDimension.toFloat() / maxOf(original.width, original.height))
+        val bitmap = if (scale < 1f) {
+            Bitmap.createScaledBitmap(
+                original,
+                (original.width * scale).toInt(),
+                (original.height * scale).toInt(),
+                true
+            )
+        } else original
+
+        val output = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 82, output)
+        if (bitmap !== original) bitmap.recycle()
+        original.recycle()
+        return output.toByteArray()
+    }
+
+    private fun postOpenAi(apiKey: String, body: String): String {
+        val connection = (URL("https://api.openai.com/v1/responses").openConnection() as HttpURLConnection)
+        try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = 30_000
+            connection.readTimeout = 90_000
+            connection.doOutput = true
+            connection.setRequestProperty("Authorization", "Bearer $apiKey")
+            connection.setRequestProperty("Content-Type", "application/json")
+            connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+
+            val status = connection.responseCode
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+            val response = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            if (status !in 200..299) {
+                throw IllegalStateException("OpenAI API error ($status): ${extractError(response)}")
+            }
+            return response
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun extractError(response: String): String {
+        return try {
+            JSONObject(response).optJSONObject("error")?.optString("message") ?: response.take(300)
+        } catch (_: Exception) {
+            response.take(300)
+        }
+    }
+
+    private fun parseVisionResult(response: String): VisionResult {
+        val root = JSONObject(response)
+        val output = root.optJSONArray("output") ?: throw IllegalStateException("No model output returned.")
+        val textBuilder = StringBuilder()
+        for (i in 0 until output.length()) {
+            val item = output.optJSONObject(i) ?: continue
+            val content = item.optJSONArray("content") ?: continue
+            for (j in 0 until content.length()) {
+                val part = content.optJSONObject(j) ?: continue
+                if (part.optString("type") == "output_text") {
+                    textBuilder.append(part.optString("text"))
+                }
+            }
+        }
+
+        val raw = textBuilder.toString().trim()
+        val jsonText = raw.substringAfter("```json", raw).substringBeforeLast("```").trim()
+        val result = JSONObject(jsonText)
+        return VisionResult(
+            verdict = result.optString("verdict", "UNCLEAR"),
+            confidence = result.optDouble("confidence", 0.0),
+            evidence = result.optString("evidence", "The model did not provide evidence details."),
+            nextAction = result.optString("next_action", "ESCALATE_TO_HUMAN")
+        )
+    }
+
+    fun createPhotoTicket(issue: PhotoIssue, orderId: String?, verification: VisionResult): Int {
+        val summary = buildString {
+            append("${issue.displayName} photo verification: ${verification.verdict}")
+            if (orderId != null) append(" for $orderId")
+            append(" | ${verification.evidence}")
         }
         escalate(summary)
         return tickets.last().id
@@ -175,23 +320,60 @@ class SupportEngine {
 fun App() {
     val engine = remember { SupportEngine() }
     var screen by remember { mutableStateOf("CUSTOMER") }
+    var showSettings by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val preferences = remember {
+        context.getSharedPreferences("support_agent_settings", Context.MODE_PRIVATE)
+    }
+    var apiKey by remember { mutableStateOf(preferences.getString("openai_api_key", "") ?: "") }
 
     MaterialTheme {
         Column(Modifier.fillMaxSize()) {
             Row(
                 Modifier.fillMaxWidth().padding(12.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Button(onClick = { screen = "CUSTOMER" }) { Text("Customer") }
                 Button(onClick = { screen = "EXECUTIVE" }) { Text("Executive") }
+                TextButton(onClick = { showSettings = true }) { Text("AI Settings") }
             }
-            if (screen == "CUSTOMER") CustomerScreen(engine) else ExecutiveScreen(engine)
+            if (screen == "CUSTOMER") CustomerScreen(engine, apiKey) else ExecutiveScreen(engine)
+        }
+
+        if (showSettings) {
+            AlertDialog(
+                onDismissRequest = { showSettings = false },
+                title = { Text("AI image verification") },
+                text = {
+                    Column {
+                        Text("Enter your OpenAI API key. It is stored only on this phone for this demo.")
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = apiKey,
+                            onValueChange = { apiKey = it },
+                            label = { Text("OpenAI API key") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        preferences.edit().putString("openai_api_key", apiKey.trim()).apply()
+                        showSettings = false
+                    }) { Text("Save") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showSettings = false }) { Text("Cancel") }
+                }
+            )
         }
     }
 }
 
 @Composable
-fun CustomerScreen(engine: SupportEngine) {
+fun CustomerScreen(engine: SupportEngine, apiKey: String) {
     val context = LocalContext.current
     val messages = remember {
         mutableStateListOf(Message("Agent", "Hi! I'm your support assistant. How can I help?"))
@@ -200,6 +382,8 @@ fun CustomerScreen(engine: SupportEngine) {
     var photoIssue by remember { mutableStateOf<PhotoIssue?>(null) }
     var selectedPhotos by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var verificationMessage by remember { mutableStateOf<String?>(null) }
+    var isVerifying by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 6)
@@ -232,7 +416,7 @@ fun CustomerScreen(engine: SupportEngine) {
                 item {
                     Card(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
                         Column(Modifier.padding(12.dp)) {
-                            Text("Photo evidence required", style = MaterialTheme.typography.titleMedium)
+                            Text("AI photo verification", style = MaterialTheme.typography.titleMedium)
                             Text("Issue: ${issue.displayName}")
                             Text("Upload a minimum of 2 clear photos showing the problem.")
                             Spacer(Modifier.height(8.dp))
@@ -260,25 +444,51 @@ fun CustomerScreen(engine: SupportEngine) {
                                 }
 
                                 Button(
-                                    enabled = selectedPhotos.size >= 2,
+                                    enabled = selectedPhotos.size >= 2 && !isVerifying,
                                     onClick = {
-                                        val result = engine.verifyPhotoEvidence(context, selectedPhotos, issue)
-                                        verificationMessage = result
-                                        if (selectedPhotos.size >= 2 && result.contains("quality/count checks passed")) {
-                                            val ticketId = engine.createPhotoTicket(issue, null)
-                                            messages.add(
-                                                Message(
-                                                    "Agent",
-                                                    "$result\n\nI've created ticket #$ticketId for human review. The standalone build currently validates the image files and photo count; true visual verification (for example, deciding whether a photo actually shows spillage or an expired label) needs a vision model/API."
+                                        if (apiKey.isBlank()) {
+                                            verificationMessage = "Open AI Settings and enter your OpenAI API key first."
+                                            return@Button
+                                        }
+
+                                        isVerifying = true
+                                        verificationMessage = "AI is analyzing all ${selectedPhotos.size} photos..."
+                                        val photos = selectedPhotos
+                                        scope.launch {
+                                            try {
+                                                val result = withContext(Dispatchers.IO) {
+                                                    engine.verifyPhotoEvidence(context, photos, issue, apiKey)
+                                                }
+                                                val ticketId = engine.createPhotoTicket(issue, null, result)
+                                                verificationMessage = ""
+                                                messages.add(
+                                                    Message(
+                                                        "Agent",
+                                                        buildString {
+                                                            append("AI verification: ${result.verdict}\n")
+                                                            append("Confidence: ${(result.confidence * 100).toInt()}%\n")
+                                                            append("Evidence: ${result.evidence}\n")
+                                                            when (result.nextAction) {
+                                                                "REFUND_OR_REPLACE" -> append("The evidence supports the reported issue. The case is ready for refund/replacement review.\n")
+                                                                "ASK_FOR_CLEARER_PHOTOS" -> append("Please upload clearer photos so I can verify the issue.\n")
+                                                                else -> append("I've sent the case to a human executive for review.\n")
+                                                            }
+                                                            append("Ticket #$ticketId")
+                                                        }
+                                                    )
                                                 )
-                                            )
-                                            photoIssue = null
-                                            selectedPhotos = emptyList()
+                                                photoIssue = null
+                                                selectedPhotos = emptyList()
+                                            } catch (e: Exception) {
+                                                verificationMessage = e.message ?: "Image verification failed. Please try again."
+                                            } finally {
+                                                isVerifying = false
+                                            }
                                         }
                                     },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Text("Verify photos")
+                                    Text(if (isVerifying) "Verifying..." else "Verify photos with AI")
                                 }
                             }
 
